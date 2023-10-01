@@ -5,7 +5,8 @@
 After first release candidate:
 
 * Check the bundled JDK version, and update product/local.properties to point at it.
-* Use the new project wizard to create an "Empty Activity" project.
+* Use the new project wizard to create an "Empty Activity" project, with "Minimum SDK"
+  set to Chaquopy's current minimum.
 * Create a directory integration/data/base-X.Y, where X.Y is the Android Gradle plugin
   version.
 * Copy the contents from the previous base-X.Y directory, then update them with the
@@ -18,7 +19,7 @@ After stable release:
   new project wizard.
 * Update the demo and pkgtest apps as follows. Leave the public apps alone for now: they
   will be dealt with during the next release (see release/README.md).
-  * Run Android Studio Upgrade Assistant.
+  * In Android Studio, run Tools > AGP Upgrade Assistant.
   * Update all items from the "base" directory above.
   * Update .gitignore file, and git rm any newly-ignored files.
   * Test the app.
@@ -38,7 +39,7 @@ After stable release:
 ## Removing support for an Android Gradle plugin version
 
 * Increment Chaquopy major version if not already done.
-* Update MIN_ANDROID_PLUGIN_VER in PythonPlugin.
+* Update MIN_AGP_VERSION in Common.java.
 * Check if there's any version-dependent code in the plugin or the tests which can now
   be removed.
 * Integration tests:
@@ -63,8 +64,9 @@ After stable release:
 
 * Update gradle-plugin/src/main/python/chaquopy/util.py.
 * Update `testPython` in gradle-plugin/build.gradle, and run the tests.
-* Update `OLD_BUILD_PYTHON_VERSION` and `MIN_BUILD_PYTHON_VERSION` in test_gradle_plugin,
-  and run the tests which use them.
+* In test_gradle_plugin, update `OLD_BUILD_PYTHON_VERSIONS` and
+  `MIN_BUILD_PYTHON_VERSION`, and run the tests which use them.
+* In the ci.yml job `test-integration`, update `extra-versions`.
 * Update android.rst.
 
 

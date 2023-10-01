@@ -6,10 +6,10 @@ import csv
 from dataclasses import dataclass
 from email import generator, message, parser
 from glob import glob
-import jsonschema
 import multiprocessing
 import os
-from os.path import abspath, basename, dirname, exists, isdir, join
+from os.path import abspath, basename, dirname, exists, isdir, join, splitext
+from pathlib import Path
 import pkg_resources
 import re
 import shlex
@@ -18,12 +18,15 @@ import sys
 import tempfile
 from textwrap import dedent
 
+import build
 from elftools.elf.elffile import ELFFile
 import jinja2
+import jsonschema
+import pypi_simple
 import yaml
 
 
-PROGRAM_NAME = basename(__file__)
+PROGRAM_NAME = splitext(basename(__file__))[0]
 PYPI_DIR = abspath(dirname(__file__))
 RECIPES_DIR = f"{PYPI_DIR}/packages"
 
@@ -66,7 +69,6 @@ ABIS = {abi.name: abi for abi in [
 
 
 class BuildWheel:
-
     def main(self):
         try:
             self.parse_args()
@@ -78,10 +80,14 @@ class BuildWheel:
             self.name_version = (normalize_name_wheel(self.package) + "-" +
                                  normalize_version(self.version))
 
-            self.needs_cmake = False
-            if "cmake" in self.meta["requirements"]["build"]:
-                self.meta["requirements"]["build"].remove("cmake")
-                self.needs_cmake = True
+            self.non_python_build_reqs = set()
+            for name in ["cmake", "fortran"]:
+                try:
+                    self.meta["requirements"]["build"].remove(name)
+                except ValueError:
+                    pass
+                else:
+                    self.non_python_build_reqs.add(name)
 
             self.needs_python = self.needs_target = (self.meta["source"] == "pypi")
             for name in ["openssl", "python", "sqlite"]:
@@ -112,38 +118,57 @@ class BuildWheel:
             self.python_tag = self.non_python_tag
         self.compat_tag = f"{self.python_tag}-android_{self.api_level}_{self.abi_tag}"
 
-        build_reqs = self.get_requirements("build")
-        if build_reqs:
-            run(f"{self.pip} install{' -v' if self.verbose else ''} " +
-                " ".join(f"{name}=={version}" for name, version in build_reqs))
-
+        # TODO: move this to {PYPI_DIR}/build/{package}/{version}, which is one level
+        # shallower, more consistent with the layout of dist/ and packages/, and keeps
+        # all the build directories together for easier cleanup. But first, check
+        # whether any build scripts or patches use relative paths to get things from the
+        # RECIPE_DIR, and make them use the environment variable instead.
         self.version_dir = f"{self.package_dir}/build/{self.version}"
         ensure_dir(self.version_dir)
         cd(self.version_dir)
         self.build_dir = f"{self.version_dir}/{self.compat_tag}"
         self.src_dir = f"{self.build_dir}/src"
+        self.build_env = f"{self.build_dir}/env"
+        self.host_env = f"{self.build_dir}/requirements"
 
         if self.no_unpack:
-            log("Skipping download and unpack due to --no-unpack")
-            assert_isdir(self.build_dir)
+            log("Reusing existing build directory due to --no-unpack")
+            assert_isdir(self.src_dir)
         else:
             ensure_empty(self.build_dir)
             self.unpack_source()
             self.apply_patches()
+            self.create_host_env()
 
-        self.reqs_dir = f"{self.build_dir}/requirements"
-        if self.no_reqs:
-            log("Skipping requirements extraction due to --no-reqs")
-        else:
-            self.extract_requirements()
+        # ProjectBuilder requires at least one of pyproject.toml or setup.py to exist,
+        # which may not be the case for packages built using build.sh (e.g.
+        # tflite-runtime).
+        if self.needs_python:
+            pyproject_toml = Path(f"{self.src_dir}/pyproject.toml")
+            setup_py = Path(f"{self.src_dir}/setup.py")
+            src_is_pyproject = pyproject_toml.exists() or setup_py.exists()
+            try:
+                if not src_is_pyproject:
+                    pyproject_toml.touch()
+                self.builder = build.ProjectBuilder(
+                    self.src_dir, python_executable=f"{self.build_env}/bin/python")
+            finally:
+                if not src_is_pyproject:
+                    pyproject_toml.unlink()
+
+            if not self.no_unpack:
+                self.create_build_env(src_is_pyproject)
 
         if self.no_build:
             log("Skipping build due to --no-build")
         else:
-            self.update_env()
+            # These environment variables are specific to the host platform, so they
+            # must not be visible to create_build_env.
+            self.update_environ()
+
             self.create_dummy_libs()
             wheel_filename = self.build_wheel()
-            return self.fix_wheel(wheel_filename)
+            self.fix_wheel(wheel_filename)
 
     def parse_args(self):
         ap = argparse.ArgumentParser(add_help=False)
@@ -151,14 +176,11 @@ class BuildWheel:
         ap.add_argument("-v", "--verbose", action="store_true", help="Log more detail")
 
         skip_group = ap.add_mutually_exclusive_group()
-        skip_group.add_argument("--no-unpack", action="store_true", help="Skip download and unpack "
-                                "(an existing build/.../src directory must exist, and will be "
-                                "reused)")
-        skip_group.add_argument("--no-build", action="store_true", help="Download and unpack, but "
-                                "skip build")
+        skip_group.add_argument("--no-unpack", action="store_true",
+                                help="Reuse an existing build directory")
+        skip_group.add_argument("--no-build", action="store_true",
+                                help="Prepare the build directory, but skip the build")
 
-        ap.add_argument("--no-reqs", action="store_true", help="Skip extracting requirements "
-                        "(any existing build/.../requirements directory will be reused)")
         ap.add_argument("--abi", metavar="ABI", required=True, choices=ABIS,
                         help="Android ABI: choices=[%(choices)s]")
         ap.add_argument("--api-level", metavar="LEVEL", type=int, default=21,
@@ -202,9 +224,58 @@ class BuildWheel:
             raise CommandError(f"Found {len(zips)} {self.abi} ZIPs in {target_version_dir}")
         self.target_zip = zips[0]
 
-        # Many setup.py scripts will behave differently depending on the Python version,
-        # so we run pip with a matching version.
-        self.pip = f"python{self.python} -m pip --disable-pip-version-check"
+    def create_build_env(self, src_is_pyproject):
+        # Installing Python's bundled pip and setuptools into a new environment takes
+        # about 3.5 seconds on Python 3.8, and 6 seconds on Python 3.11. To avoid this,
+        # we create one bootstrap environment per Python version, shared between all
+        # packages, and use that to install the build environments.
+        os.environ["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        bootstrap_env = self.get_bootstrap_env()
+        ensure_empty(self.build_env)
+        run(f"python{self.python} -m venv --without-pip {self.build_env}")
+
+        # In case meta.yaml and pyproject.toml have requirements for the same package,
+        # listing the more specific requirements first will help pip find a solution
+        # faster.
+        build_reqs = ([f"{package}=={version}"
+                       for package, version in self.get_requirements("build")]
+                      + list(self.builder.build_system_requires))
+
+        def pip_install(requirements):
+            if not requirements:
+                return
+            run(f"{bootstrap_env}/bin/pip --python {self.builder.python_executable} "
+                f"install " + " ".join(shlex.quote(req) for req in requirements))
+
+        # In the common case where get_requires_for_build only returns things which were
+        # already in build_system_requires, we can avoid running pip a second time.
+        pip_install(build_reqs)
+        if src_is_pyproject:
+            pip_install(self.builder.get_requires_for_build("wheel") - set(build_reqs))
+
+    def get_bootstrap_env(self):
+        bootstrap_env = f"{PYPI_DIR}/build/_bootstrap/{self.python}"
+        pip_version = "23.2.1"
+
+        def check_bootstrap_env():
+            if not run(
+                f"{bootstrap_env}/bin/pip --version", capture_output=True
+            ).stdout.startswith(f"pip {pip_version} "):
+                raise CommandError("pip version mismatch")
+
+        if exists(bootstrap_env):
+            try:
+                check_bootstrap_env()
+                return bootstrap_env
+            except CommandError as e:
+                log(e)
+                log("Invalid bootstrap environment: recreating it")
+                ensure_empty(bootstrap_env)
+
+        run(f"python{self.python} -m venv {bootstrap_env}")
+        run(f"{bootstrap_env}/bin/pip install pip=={pip_version}")
+        check_bootstrap_env()
+        return bootstrap_env
 
     def unpack_source(self):
         source = self.meta["source"]
@@ -229,12 +300,6 @@ class BuildWheel:
                 run(f"rm -rf {temp_dir}")
             else:
                 run(f"mv {temp_dir} {self.src_dir}")
-
-            # pyproject.toml may conflict with our own requirements mechanism, so we currently
-            # disable it.
-            if exists(f"{self.src_dir}/pyproject.toml"):
-                run(f"mv {self.src_dir}/pyproject.toml "
-                    f"{self.src_dir}/pyproject-chaquopy-disabled.toml")
 
     def download_git(self, source):
         git_rev = source["git_rev"]
@@ -262,32 +327,39 @@ class BuildWheel:
         return tgz_filename
 
     def download_pypi(self):
-        sdist_filename = self.find_sdist()
-        if sdist_filename:
-            log("Using cached sdist")
-        else:
-            result = run(f"{self.pip} download{' -v' if self.verbose else ''} --no-deps "
-                         f"--no-binary {self.package} --no-build-isolation "
-                         f"{self.package}=={self.version}", check=False)
-            if result.returncode:
-                # Even with --no-deps, `pip download` still pointlessly runs egg_info on the
-                # downloaded sdist, which installs anything in `setup_requires`
-                # (https://github.com/pypa/pip/issues/1884). If this fails or takes a long
-                # time, we can't work around it by patching the package, because we haven't had
-                # a chance to apply the patches yet.
-                warn(f"pip download returned exit status {result.returncode}")
-            sdist_filename = self.find_sdist()
-            if not sdist_filename:
-                raise CommandError("Can't find downloaded source archive. Does the name and "
-                                   "version in the package's meta.yaml match the filename "
-                                   "shown above?")
-        return sdist_filename
-
-    def find_sdist(self):
-        for ext in ["zip", "tar.gz", "tgz", "tar.bz2", "tbz2", "tar.xz", "txz"]:
+        EXTENSIONS = ["zip", "tar.gz", "tgz", "tar.bz2", "tbz2", "tar.xz", "txz"]
+        for ext in EXTENSIONS:
             filename = f"{self.package}-{self.version}.{ext}"
             if exists(filename):
+                log("Using cached sdist")
                 return filename
+
+        # Even with --no-deps, `pip download` still pointlessly runs egg_info on the
+        # downloaded sdist, which may fail or take a long time
+        # (https://github.com/pypa/pip/issues/1884). So we download the sdist manually.
+        log("Searching PyPI")
+        pypi = pypi_simple.PyPISimple()
+        try:
+            project = pypi.get_project_page(self.package)
+        except pypi_simple.NoSuchProjectError as e:
+            raise CommandError(e)
+
+        for package in project.packages:
+            if (
+                (package.project, package.version) == (self.package, self.version)
+                and any(package.filename.endswith("." + ext) for ext in EXTENSIONS)
+            ):
+                log(f"Downloading {package.url}")
+                pypi.download_package(
+                    package, package.filename,
+                    progress=pypi_simple.tqdm_progress_factory(
+                        unit="B", unit_scale=True, unit_divisor=1024))
+                return package.filename
+        else:
+            raise CommandError(
+                f"Can't find sdist for {self.package!r} version {self.version!r} at "
+                f"{pypi.get_project_url(self.package)}. Check the name and version "
+                f"for spelling, capitalization and punctuation.")
 
     def download_url(self, url):
         source_filename = url[url.rfind("/") + 1:]
@@ -310,16 +382,16 @@ class BuildWheel:
         if exists(build_script):
             return self.build_with_script(build_script)
         elif self.needs_python:
-            return self.build_with_pip()
+            return self.build_with_pep517()
         else:
             raise CommandError("Don't know how to build: no build.sh exists, and this is not "
                                "declared as a Python package. Do you need to add a `host` "
                                "requirement of `python`? See meta-schema.yaml.")
 
-    def extract_requirements(self):
-        ensure_empty(self.reqs_dir)
+    def create_host_env(self):
+        ensure_empty(self.host_env)
         for subdir in ["include", "lib"]:
-            ensure_dir(f"{self.reqs_dir}/chaquopy/{subdir}")
+            ensure_dir(f"{self.host_env}/chaquopy/{subdir}")
         if self.needs_target:
             self.extract_target()
 
@@ -336,21 +408,22 @@ class BuildWheel:
                     if match and (int(match["api_level"]) <= self.api_level):
                         matches.append(match)
             if not matches:
-                raise CommandError(f"Couldn't find wheel for requirement {package} {version}")
+                raise CommandError(f"Couldn't find compatible wheel for {package} "
+                                   f"{version} in {dist_dir}")
             matches.sort(key=lambda match: int(match.group("build_num")))
             wheel_filename = join(dist_dir, matches[-1].group(0))
-            run(f"unzip -d {self.reqs_dir} -q {wheel_filename}")
+            run(f"unzip -d {self.host_env} -q {wheel_filename}")
 
             # Move data files into place (used by torchvision to build against torch).
-            data_dir = f"{self.reqs_dir}/{package}-{version}.data/data"
+            data_dir = f"{self.host_env}/{package}-{version}.data/data"
             if exists(data_dir):
                 for name in os.listdir(data_dir):
-                    run(f"mv {data_dir}/{name} {self.reqs_dir}")
+                    run(f"mv {data_dir}/{name} {self.host_env}")
 
             # Put headers on the include path (used by gevent to build against greenlet).
-            include_src = f"{self.reqs_dir}/{package}-{version}.data/headers"
+            include_src = f"{self.host_env}/{package}-{version}.data/headers"
             if exists(include_src):
-                include_tgt = f"{self.reqs_dir}/chaquopy/include/{package}"
+                include_tgt = f"{self.host_env}/chaquopy/include/{package}"
                 run(f"mkdir -p {dirname(include_tgt)}")
                 run(f"mv {include_src} {include_tgt}")
 
@@ -361,7 +434,7 @@ class BuildWheel:
         SONAME_PATTERNS = [(r"^(lib.*)\.so\..*$", r"\1.so"),
                            (r"^(lib.*?)\d+\.so$", r"\1.so"),  # e.g. libpng
                            (r"^(lib.*)_chaquopy\.so$", r"\1.so")]  # e.g. libjpeg
-        reqs_lib_dir = f"{self.reqs_dir}/chaquopy/lib"
+        reqs_lib_dir = f"{self.host_env}/chaquopy/lib"
         for filename in os.listdir(reqs_lib_dir):
             for pattern, repl in SONAME_PATTERNS:
                 link_filename = re.sub(pattern, repl, filename)
@@ -374,38 +447,35 @@ class BuildWheel:
     # don't have to patch everything that links against them.
     def create_dummy_libs(self):
         for name in ["pthread", "rt"]:
-            run(f"{os.environ['AR']} rc {self.reqs_dir}/chaquopy/lib/lib{name}.a")
+            run(f"{os.environ['AR']} rc {self.host_env}/chaquopy/lib/lib{name}.a")
 
     def extract_target(self):
-        run(f"unzip -q -d {self.reqs_dir}/chaquopy {self.target_zip} include/* jniLibs/*")
-        run(f"mv {self.reqs_dir}/chaquopy/jniLibs/{self.abi}/* {self.reqs_dir}/chaquopy/lib",
+        run(f"unzip -q -d {self.host_env}/chaquopy {self.target_zip} include/* jniLibs/*")
+        run(f"mv {self.host_env}/chaquopy/jniLibs/{self.abi}/* {self.host_env}/chaquopy/lib",
             shell=True)
-        run(f"rm -r {self.reqs_dir}/chaquopy/jniLibs")
+        run(f"rm -r {self.host_env}/chaquopy/jniLibs")
 
     def build_with_script(self, build_script):
         prefix_dir = f"{self.build_dir}/prefix"
         ensure_empty(prefix_dir)
         os.environ["PREFIX"] = ensure_dir(f"{prefix_dir}/chaquopy")  # Conda variable name
-        run(build_script)
+
+        if self.needs_python:
+            run(f". {self.build_env}/bin/activate; {build_script}", shell=True)
+        else:
+            run(build_script)
         return self.package_wheel(prefix_dir, self.src_dir)
 
-    def build_with_pip(self):
-        # We can't run "setup.py bdist_wheel" directly, because that would only work with
-        # setuptools-aware setup.py files.
-        run(f"{self.pip} wheel --no-deps "
-            # --no-clean doesn't currently work: see env/python/sitecustomize.py.
-            #
-            # We pass -v unconditionally, because we always want to see the build process
-            # output. --global-option=-vv enables additional distutils logging.
-            f"-v {'--global-option=-vv ' if self.verbose else ''}"
-            f"-e .")
-        wheel_filename, = glob("*.whl")  # Note comma
-        return abspath(wheel_filename)
+    def build_with_pep517(self):
+        try:
+            return self.builder.build("wheel", "dist")
+        except build.BuildBackendException as e:
+            raise CommandError(e)
 
-    def update_env(self):
+    def update_environ(self):
         env = {}
         build_common_output = run(
-            f"abi={self.abi}; api_level={self.api_level}; prefix={self.reqs_dir}/chaquopy; "
+            f"abi={self.abi}; api_level={self.api_level}; prefix={self.host_env}/chaquopy; "
             f". {PYPI_DIR}/../../target/build-common.sh; export",
             shell=True, executable="bash", text=True, stdout=subprocess.PIPE
         ).stdout
@@ -424,15 +494,43 @@ class BuildWheel:
         # See env/bin/pkg-config.
         del env["PKG_CONFIG"]
 
+        compiler_vars = ["CC", "CXX", "LD"]
+        if "fortran" in self.non_python_build_reqs:
+            tool_prefix = ABIS[self.abi].tool_prefix
+            toolchain = self.abi if self.abi in ["x86", "x86_64"] else tool_prefix
+            gfortran = f"{PYPI_DIR}/fortran/{toolchain}-4.9/bin/{tool_prefix}-gfortran"
+            if not exists(gfortran):
+                raise CommandError(f"This package requries a Fortran compiler, but "
+                                   f"{gfortran} does not exist. See README.md.")
+
+            compiler_vars += ["FC", "F77", "F90"]
+            env["FC"] = gfortran  # Used by OpenBLAS
+            env["F77"] = env["F90"] = gfortran  # Used by numpy.distutils
+            env["FARCH"] = env["CFLAGS"]  # Used by numpy.distutils
+
         env_dir = f"{PYPI_DIR}/env"
         env["PATH"] = os.pathsep.join([
             f"{env_dir}/bin",
-            f"{self.reqs_dir}/chaquopy/bin",  # For "-config" scripts.
+            f"{self.host_env}/chaquopy/bin",  # For "-config" scripts.
             os.environ["PATH"]])
 
-        # Adding reqs_dir to PYTHONPATH allows setup.py to import requirements, for example to
+        # Wrap compiler and linker commands with a script which removes include and
+        # library directories which are not in known safe locations.
+        for var in compiler_vars:
+            real_path = env[var]
+            wrapper_path = join(ensure_dir(f"{self.build_dir}/wrappers"),
+                                basename(real_path))
+            with open(wrapper_path, "w") as wrapper_file:
+                print(dedent(f"""\
+                    #!/bin/sh
+                    exec "{PYPI_DIR}/compiler-wrapper.py" "{real_path}" "$@"
+                    """), file=wrapper_file)
+            os.chmod(wrapper_path, 0o755)
+            env[var] = wrapper_path
+
+        # Adding host_env to PYTHONPATH allows setup.py to import requirements, for example to
         # call numpy.get_include().
-        pythonpath = [f"{env_dir}/lib/python", self.reqs_dir]
+        pythonpath = [f"{env_dir}/lib/python", self.host_env]
         if "PYTHONPATH" in os.environ:
             pythonpath.append(os.environ["PYTHONPATH"])
         env["PYTHONPATH"] = os.pathsep.join(pythonpath)
@@ -449,10 +547,10 @@ class BuildWheel:
         env["LDSHARED"] = f"{env['CC']} -shared"
 
         if self.needs_python:
-            self.python_include_dir = f"{self.reqs_dir}/chaquopy/include/python{self.python}"
+            self.python_include_dir = f"{self.host_env}/chaquopy/include/python{self.python}"
             assert_exists(self.python_include_dir)
             libpython = f"libpython{self.python}.so"
-            self.python_lib = f"{self.reqs_dir}/chaquopy/lib/{libpython}"
+            self.python_lib = f"{self.host_env}/chaquopy/lib/{libpython}"
             assert_exists(self.python_lib)
             self.standard_libs.append(libpython)
 
@@ -471,6 +569,7 @@ class BuildWheel:
             "HOST": ABIS[self.abi].tool_prefix,
 
             # Overrides sysconfig.get_platform and distutils.util.get_platform.
+            # TODO: consider replacing this with crossenv.
             "_PYTHON_HOST_PLATFORM": f"linux_{ABIS[self.abi].uname_machine}",
 
             # conda-build variable names defined at
@@ -487,17 +586,17 @@ class BuildWheel:
             key, value = var.split("=")
             env[key] = value
 
-        if self.needs_cmake:
+        if "cmake" in self.non_python_build_reqs:
             self.generate_cmake_toolchain(env)
 
         if self.verbose:
-            # Format variables so they can be pasted into a shell when troubleshooting.
             log("Environment set as follows:\n" +
-                "\n".join(f"export {key}='{value}'" for key, value in env.items()))
+                "\n".join(f"export {key}={shlex.quote(value)}"
+                          for key, value in env.items()))
         os.environ.update(env)
 
     def generate_cmake_toolchain(self, env):
-        ndk = abspath(f"{env['CC']}/../../../../../..")
+        ndk = abspath(f"{env['AR']}/../../../../../..")
         toolchain_filename = join(self.build_dir, "chaquopy.toolchain.cmake")
 
         # This environment variable requires CMake 3.21 or later, so until we can rely on
@@ -513,7 +612,7 @@ class BuildWheel:
                 set(ANDROID_STL c++_shared)
                 include({ndk}/build/cmake/android.toolchain.cmake)
 
-                list(INSERT CMAKE_FIND_ROOT_PATH 0 {self.reqs_dir}/chaquopy)
+                list(INSERT CMAKE_FIND_ROOT_PATH 0 {self.host_env}/chaquopy)
                 """), file=toolchain_file)
 
             if self.needs_python:
@@ -555,7 +654,7 @@ class BuildWheel:
 
         SO_PATTERN = r"\.so(\.|$)"
         available_libs = set(self.standard_libs)
-        for dir_name in [f"{self.reqs_dir}/chaquopy/lib", tmp_dir]:
+        for dir_name in [f"{self.host_env}/chaquopy/lib", tmp_dir]:
             if exists(dir_name):
                 for _, _, filenames in os.walk(dir_name):
                     available_libs.update(name for name in filenames
@@ -597,10 +696,9 @@ class BuildWheel:
             if exists(info_metadata_json):
                 run(f"rm {info_metadata_json}")
 
-        out_dir = ensure_dir(f"{PYPI_DIR}/dist/{normalize_name_pypi(self.package)}")
-        out_filename = self.package_wheel(tmp_dir, out_dir)
-        log(f"Wrote {out_filename}")
-        return out_filename
+        # `wheel pack` logs the absolute wheel filename.
+        self.package_wheel(
+            tmp_dir, ensure_dir(f"{PYPI_DIR}/dist/{normalize_name_pypi(self.package)}"))
 
     def package_wheel(self, in_dir, out_dir):
         build_num = os.environ["PKG_BUILDNUM"]
@@ -670,13 +768,19 @@ class BuildWheel:
         schema = yaml.safe_load(open(f"{PYPI_DIR}/meta-schema.yaml"))
         Validator.check_schema(schema)
 
-        meta_input = open(f"{self.package_dir}/meta.yaml").read()
+        meta_filename = assert_exists(f"{self.package_dir}/meta.yaml")
         meta_vars = {}
         if self.python:
             meta_vars["PY_VER"] = self.python
 
-        meta = yaml.safe_load(jinja2.Template(meta_input).render(**meta_vars))
-        with_defaults(Validator)(schema).validate(meta)
+        try:
+            meta = yaml.safe_load(
+                jinja2.Template(open(meta_filename).read()).render(**meta_vars))
+            with_defaults(Validator)(schema).validate(meta)
+        except (
+            jinja2.TemplateSyntaxError, jsonschema.ValidationError, yaml.YAMLError
+        ) as e:
+            raise CommandError(f"Failed to parse {meta_filename}: {e}")
         return meta
 
     def find_package(self, name):
@@ -759,13 +863,14 @@ def run(command, **kwargs):
     log(command)
     kwargs.setdefault("check", True)
     kwargs.setdefault("shell", False)
+    kwargs.setdefault("text", True)
 
     if isinstance(command, str) and not kwargs["shell"]:
         command = shlex.split(command)
     try:
         return subprocess.run(command, **kwargs)
-    except subprocess.CalledProcessError as e:
-        raise CommandError(f"Command returned exit status {e.returncode}")
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise CommandError(e)
 
 
 def ensure_empty(dir_name):
@@ -787,6 +892,7 @@ def assert_isdir(filename):
 def assert_exists(filename):
     if not exists(filename):
         raise CommandError(f"{filename} does not exist")
+    return filename
 
 
 def cd(new_dir):

@@ -1,9 +1,9 @@
 package:
   name: gevent
-  version: 1.4.0
+  version: "1.4.0"
 
 build:
-  number: 3
+  number: 4
 
 requirements:
   host:
