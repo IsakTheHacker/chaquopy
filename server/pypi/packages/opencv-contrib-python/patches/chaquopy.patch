@@ -1,6 +1,6 @@
---- src-original/opencv/cmake/OpenCVDetectPython.cmake  2021-01-02 12:14:24.000000000 +0000
-+++ src/opencv/cmake/OpenCVDetectPython.cmake   2021-01-27 16:40:13.164104124 +0000
-@@ -123,7 +123,7 @@
+--- src-original/opencv/cmake/OpenCVDetectPython.cmake
++++ src/opencv/cmake/OpenCVDetectPython.cmake
+@@ -123,7 +123,7 @@ if(NOT ${found})
    if(_found)
      set(_version_major_minor "${_version_major}.${_version_minor}")
 
@@ -9,7 +9,7 @@
        ocv_check_environment_variables(${library_env} ${include_dir_env})
        if(NOT ${${library_env}} STREQUAL "")
            set(PYTHON_LIBRARY "${${library_env}}")
-@@ -144,8 +144,8 @@
+@@ -144,8 +144,8 @@ if(NOT ${found})
          # Copy outputs
          set(_libs_found ${PYTHONLIBS_FOUND})
          set(_libraries ${PYTHON_LIBRARIES})
@@ -20,16 +20,16 @@
          set(_debug_libraries ${PYTHON_DEBUG_LIBRARIES})
          set(_libs_version_string ${PYTHONLIBS_VERSION_STRING})
          set(_debug_library ${PYTHON_DEBUG_LIBRARY})
-@@ -175,7 +175,7 @@
+@@ -175,7 +175,7 @@ if(NOT ${found})
        endif()
      endif()
 
 -    if(NOT ANDROID AND NOT IOS)
 +    if(NOT IOS)  # Chaquopy: removed ANDROID exclusion
        if(CMAKE_HOST_UNIX)
-         execute_process(COMMAND ${_executable} -c "from distutils.sysconfig import *; print(get_python_lib())"
+         execute_process(COMMAND ${_executable} -c "from sysconfig import *; print(get_path('purelib'))"
                          RESULT_VARIABLE _cvpy_process
-@@ -240,7 +240,7 @@
+@@ -240,7 +240,7 @@ if(NOT ${found})
                            OUTPUT_STRIP_TRAILING_WHITESPACE)
          endif()
        endif()
@@ -38,9 +38,9 @@
    endif()
 
    # Export return values
---- src-original/opencv/CMakeLists.txt  2021-01-02 12:14:24.000000000 +0000
-+++ src/opencv/CMakeLists.txt   2021-01-27 15:35:52.366083600 +0000
-@@ -411,7 +411,7 @@
+--- src-original/opencv/CMakeLists.txt
++++ src/opencv/CMakeLists.txt
+@@ -429,7 +429,7 @@ OCV_OPTION(WITH_GPHOTO2 "Include gPhoto2 library support" OFF
    VISIBLE_IF UNIX AND NOT ANDROID AND NOT IOS
    VERIFY HAVE_GPHOTO2)
  OCV_OPTION(WITH_LAPACK "Include Lapack library support" (NOT CV_DISABLE_OPTIMIZATION)
@@ -50,7 +50,7 @@
  OCV_OPTION(WITH_ITT "Include Intel ITT support" ON
    VISIBLE_IF NOT APPLE_FRAMEWORK
 diff --git a/opencv/modules/python/CMakeLists.txt b/opencv/modules/python/CMakeLists.txt
-index 27874283e..ee76ea661 100644
+index 93eab8c9..df10255c 100644
 --- a/opencv/modules/python/CMakeLists.txt
 +++ b/opencv/modules/python/CMakeLists.txt
 @@ -3,7 +3,7 @@
@@ -62,9 +62,9 @@ index 27874283e..ee76ea661 100644
    ocv_module_disable_(python2)
    ocv_module_disable_(python3)
    return()
---- src-original/setup.py	2021-01-02 12:13:50.000000000 +0000
-+++ src/setup.py	2021-01-28 12:43:37.969058338 +0000
-@@ -18,8 +18,11 @@
+--- src-original/setup.py
++++ src/setup.py
+@@ -18,8 +18,11 @@ def main():
      is_CI_build = True if CI_BUILD == "1" else False
      cmake_source_dir = "opencv"
      minimum_supported_numpy = "1.13.3"
@@ -76,15 +76,20 @@ index 27874283e..ee76ea661 100644
 +    build_headless = "headless" in os.environ["PKG_NAME"]
 +
      build_java = "ON" if get_build_env_var_by_name("java") else "OFF"
+     build_rolling = get_build_env_var_by_name("rolling")
  
-     if sys.version_info[:2] >= (3, 6):
-@@ -38,12 +41,26 @@
-     numpy_version = "numpy>=%s" % minimum_supported_numpy
+@@ -36,17 +39,26 @@ def main():
+     ]
  
      python_version = cmaker.CMaker.get_python_version()
--    python_lib_path = cmaker.CMaker.get_python_library(python_version).replace(
--        "\\", "/"
--    )
+-    python_lib_path = cmaker.CMaker.get_python_library(python_version) or ""
+-    # HACK: For Scikit-build 0.17.3 and newer that returns None or empty sptring for PYTHON_LIBRARY in manylinux2014
+-    # A small release related to PYTHON_LIBRARY handling changes in 0.17.2; scikit-build 0.17.3 returns an empty string from get_python_library if no Python library is present (like on manylinux), where 0.17.2 returned None, and previous versions returned a non-existent path. Note that adding REQUIRED to find_package(PythonLibs will fail, but it is incorrect (you must not link to libPython.so) and was really just injecting a non-existent path before.
+-    # TODO: Remove the hack when the issue is handled correctly in main OpenCV CMake.
+-    if python_lib_path == "":
+-        python_lib_path = "libpython%sm.a" % python_version
+-    python_lib_path = python_lib_path.replace("\\", "/")
+-
 -    python_include_dir = cmaker.CMaker.get_python_include_dir(python_version).replace(
 -        "\\", "/"
 -    )
@@ -111,18 +116,18 @@ index 27874283e..ee76ea661 100644
  
      if os.path.exists(".git"):
          import pip._internal.vcs.git as git
-@@ -65,7 +82,7 @@
+@@ -79,7 +91,7 @@ def main():
      )
  
      # https://stackoverflow.com/questions/1405913/python-32bit-or-64bit-mode
--    x64 = sys.maxsize > 2 ** 32
-+    x64 = "64" in os.environ["CHAQUOPY_ABI"]  # Chaquopy: was sys.maxsize > 2 ** 32
+-    is64 = sys.maxsize > 2 ** 32
++    is64 = "64" in os.environ["CHAQUOPY_ABI"]  # Chaquopy: was sys.maxsize > 2 ** 32
  
      package_name = "opencv-python"
  
-@@ -78,6 +95,9 @@
-     if build_headless and not build_contrib:
-         package_name = "opencv-python-headless"
+@@ -95,6 +107,9 @@ def main():
+     if build_rolling:
+         package_name += "-rolling"
  
 +    # Chaquopy
 +    package_name = os.environ["PKG_NAME"]
@@ -130,17 +135,17 @@ index 27874283e..ee76ea661 100644
      long_description = io.open("README.md", encoding="utf-8").read()
  
      packages = ["cv2", "cv2.data"]
-@@ -106,7 +126,8 @@
-             % {"ext": re.escape(sysconfig.get_config_var("EXT_SUFFIX"))}
-         ],
+@@ -134,7 +149,8 @@ def main():
+         [ r"python/cv2/py.typed" ] if sys.version_info >= (3, 6) else []
+         ,
          "cv2.data": [  # OPENCV_OTHER_INSTALL_PATH
 -            ("etc" if os.name == "nt" else "share/opencv4") + r"/haarcascades/.*\.xml"
 +            # Chaquopy: see opencv/cmake/OpenCVInstallLayout.cmake
 +            "sdk/etc" + r"/haarcascades/.*\.xml"
          ],
-     }
- 
-@@ -153,6 +174,32 @@
+         "cv2.gapi": [
+             "python/cv2" + r"/gapi/.*\.py"
+@@ -210,6 +226,32 @@ def main():
          )
      )
  
@@ -173,11 +178,11 @@ index 27874283e..ee76ea661 100644
      if build_headless:
          # it seems that cocoa cannot be disabled so on macOS the package is not truly headless
          cmake_args.append("-DWITH_WIN32UI=OFF")
-@@ -226,7 +273,7 @@
+@@ -276,7 +318,7 @@ def main():
          package_data=package_data,
-         maintainer="Olli-Pekka Heinisuo",
+         maintainer="OpenCV Team",
          ext_modules=EmptyListWithLength(),
--        install_requires=numpy_version,
+-        install_requires=install_requires,
 +        # Chaquopy: install_requires numpy is handled by meta.yaml.
          python_requires=">=3.6",
          classifiers=[
