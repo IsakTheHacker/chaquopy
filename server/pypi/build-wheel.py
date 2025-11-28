@@ -19,11 +19,14 @@ from textwrap import dedent
 import traceback
 import warnings
 
+from bs4 import BeautifulSoup
 import build
 from elftools.elf.elffile import ELFFile
 from jinja2 import StrictUndefined, Template, TemplateError
 import jsonschema
-import pypi_simple
+import requests
+from tqdm import tqdm
+from urllib.parse import urljoin
 import yaml
 
 with warnings.catch_warnings():
@@ -66,6 +69,13 @@ ABIS = {abi.name: abi for abi in [
     Abi("x86", "i686-linux-android", "i686"),
     Abi("x86_64", "x86_64-linux-android", "x86_64"),
 ]}
+
+@dataclass
+class PyPIDistributionPackage:
+    filename: str
+    project: str
+    version: str
+    url: str
 
 
 class BuildWheel:
@@ -367,16 +377,12 @@ class BuildWheel:
 
         # Even with --no-deps, `pip download` still pointlessly runs egg_info on the
         # downloaded sdist, which may fail or take a long time
-        # (https://github.com/pypa/pip/issues/1884). So we download the sdist with a
-        # different library.
+        # (https://github.com/pypa/pip/issues/1884). So we download the sdist ourselves
         log("Searching PyPI")
-        pypi = pypi_simple.PyPISimple()
-        try:
-            project = pypi.get_project_page(self.package)
-        except pypi_simple.NoSuchProjectError as e:
-            raise CommandError(e)
+        pypi = PyPISimple()
+        packages = pypi.get_project_packages(self.package)
 
-        for package in project.packages:
+        for package in packages:
             # sdist filenames used to use the original package name, but current
             # standards encourage normalization
             # (https://packaging.python.org/en/latest/specifications/source-distribution-format/).
@@ -388,8 +394,8 @@ class BuildWheel:
                 log(f"Downloading {package.url}")
                 pypi.download_package(
                     package, package.filename,
-                    progress=pypi_simple.tqdm_progress_factory(
-                        unit="B", unit_scale=True, unit_divisor=1024))
+                    progress=lambda it, total: tqdm(it, total=total, unit="B", unit_scale=True, unit_divisor=1024)
+                )
 
                 # Cache it under the unnormalized name so the code above can find it.
                 for ext in EXTENSIONS:
@@ -1062,6 +1068,69 @@ def log(s):
 class CommandError(Exception):
     pass
 
+
+class PyPISimple():
+    PYPI_SIMPLE_ENDPOINT: str = "https://pypi.org/simple/"
+
+    def __init__(self, endpoint: str = PYPI_SIMPLE_ENDPOINT):
+        self.endpoint = endpoint
+
+    def get_project_url(self, project: str) -> str:
+        return self.endpoint + normalize_name_pypi(project) + "/"
+
+    def get_project_packages(self, project: str):
+        url = f"{self.endpoint}{project}/"
+        response = requests.get(url)
+        if response.status_code == 404:
+            raise CommandError(f"Project '${project}' does not exist on PyPI")
+        response.raise_for_status()
+        html = response.text
+
+        soup = BeautifulSoup(html, "html.parser")
+        packages = []
+        for link in soup.find_all("a"):
+            href = link.get("href")
+            if not href:
+                continue
+
+            full_url: str = urljoin(url, href)
+
+            #Don't include the hash part in the filename
+            filename = href.partition("#")[0].split("/")[-1]
+
+            m = re.match(
+                rf"{re.escape(project)}-(.*?)(?:\.tar\.gz|\.zip|\.whl|\.tar\.bz2)?$",
+                filename
+            )
+            version = m.group(1) if m else None
+
+            package = PyPIDistributionPackage(
+                filename=filename,
+                project=project,
+                version=version,
+                url=full_url
+            )
+            packages.append(package)
+        return packages
+
+    def download_package(
+        self,
+        package,
+        path,
+        progress=None,
+        chunk_size=65535
+    ) -> None:
+        response = requests.get(package.url, stream=True)
+        response.raise_for_status()
+
+        total = int(response.headers.get("content-length", 0))
+        iterator = response.iter_content(chunk_size=chunk_size)
+        if progress:
+            iterator = progress(iterator, total=total)
+
+        with open(path, "wb") as f:
+            for chunk in iterator:
+                f.write(chunk)
 
 if __name__ == "__main__":
     BuildWheel().main()

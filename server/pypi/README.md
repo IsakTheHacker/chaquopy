@@ -49,9 +49,13 @@ already have the SDK, here's how to install it:
 * Rename `android-sdk/cmdline-tools/cmdline-tools` to `android-sdk/cmdline-tools/latest`.
 * `export ANDROID_HOME=/path/to/android-sdk`
 
-Use pip to install the `requirements.txt` in this directory.
+If you are on a Debian/Ubuntu-based system where pip is disabled. Use `apt` to install
+dependencies:
+    sudo apt-get install patch patchelf python3-build python3-pyelftools python3-jinja2
+    python3-jsonschema python3-pkg-resources python3-requests python3-tqdm python3-bs4
 
-Use your distribution's package manager to install the following build tools:
+If not, use pip to install the `requirements.txt` in this directory. Then use your
+distribution's package manager to install the following build tools:
 * patch
 * patchelf
 
